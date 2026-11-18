@@ -104,7 +104,9 @@ class Worker:
         assert self.lease is not None
         job_id = self.lease.job_id
         job = store.get_job(self.settings.db_path, job_id)
-        if job is None:
+        if job is None or job.get("status") == store.ERASED_STATUS:
+            # The job was erased (or otherwise vanished) between claim and
+            # start: release the lease without writing anything.
             return
         store.record_event(
             self.settings.db_path,
@@ -143,6 +145,14 @@ class Worker:
                 )
                 self.lease = None
                 return
+            except (store.JobErased, store.JobNotFound) as exc:
+                # The job was erased while this worker held it (or its row is
+                # otherwise gone).  Every write path is fenced, so there is
+                # nothing to commit: drop the lease and go idle.  Other jobs
+                # keep training normally.
+                print(f"[{self.worker_id}] {exc.__class__.__name__} for {job_id}; stopping", flush=True)
+                self.lease = None
+                return
             print(
                 f"[{self.worker_id}] {job_id} step {result['step']}/{result['total_steps']} "
                 f"loss={result['loss']:.6f}",
@@ -165,11 +175,13 @@ class Worker:
         Both are no-ops unless the environment variables are set.
         """
         crash_after = os.environ.get("TRAINING_DEMO_CRASH_AFTER")
-        if crash_after and int(crash_after) == int(
-            store.get_job(self.settings.db_path, job_id)["completed_steps"]
-        ):
-            print(f"[{self.worker_id}] simulated crash after step {crash_after}", flush=True)
-            os._exit(70)
+        if crash_after:
+            current = store.get_job(self.settings.db_path, job_id)
+            if current is None or current.get("status") == store.ERASED_STATUS:
+                return
+            if int(crash_after) == int(current["completed_steps"]):
+                print(f"[{self.worker_id}] simulated crash after step {crash_after}", flush=True)
+                os._exit(70)
 
         pause_file = os.environ.get("TRAINING_DEMO_PAUSE_FILE")
         if not pause_file:

@@ -81,6 +81,17 @@ CREATE TABLE IF NOT EXISTS lease_epochs (
     epoch  INTEGER NOT NULL
 );
 
+-- Erasure tombstones.  When a job is erased its full row (samples, weights,
+-- momentum), checkpoints, events and lease are deleted inside one transaction,
+-- and only this tombstone remains: the job id plus its erasure status/time.
+-- The row survives restarts, makes a repeated erase idempotent, and fences
+-- every worker write path so an old owner can never recreate the data.
+CREATE TABLE IF NOT EXISTS erased_jobs (
+    job_id       TEXT PRIMARY KEY,
+    status       TEXT NOT NULL DEFAULT 'erased',
+    erased_at    REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_job ON job_events(job_id, id);
 """
 

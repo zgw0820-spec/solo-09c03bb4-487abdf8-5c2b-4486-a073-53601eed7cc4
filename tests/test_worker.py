@@ -5,6 +5,7 @@ import threading
 import time
 
 import numpy as np
+import pytest
 
 from app import lease as lm
 from app import store
@@ -132,3 +133,68 @@ def test_worker_survives_a_crash_preventing_commit(tmp_path):
     epochs = [c["lease_epoch"] for c in checkpoints]
     assert epochs[:2] == [1, 1]
     assert epochs[2:] == [2] * 7
+
+
+def test_erasing_a_running_job_fences_its_worker_and_keeps_others_running(tmp_path):
+    settings = make_settings(tmp_path, batch_delay_seconds=0.05)
+    init_db(settings.db_path)
+    doomed = store.create_job(settings.db_path, *sample(32, seed=20), 3)
+    survivor = store.create_job(settings.db_path, *sample(16, seed=21), 2)
+
+    worker, thread = run_worker(settings, "w1")
+    try:
+        # Wait until the worker is actively training the first job.
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            state = store.get_job(settings.db_path, doomed["job_id"])
+            if state["completed_steps"] >= 1:
+                break
+            time.sleep(0.02)
+        assert state["completed_steps"] >= 1
+
+        tombstone = store.erase_job(settings.db_path, doomed["job_id"])
+
+        # The worker must drop the erased job and finish the survivor instead.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            other = store.get_job(settings.db_path, survivor["job_id"])
+            if other["status"] == "completed":
+                break
+            time.sleep(0.02)
+        assert other["status"] == "completed"
+    finally:
+        stop(worker, thread)
+
+    # The erased job stays a tombstone: the old worker never wrote into it
+    # again after erasure.
+    assert store.get_job(settings.db_path, doomed["job_id"]) == tombstone
+    with pytest.raises(store.JobErased):
+        store.list_checkpoints(settings.db_path, doomed["job_id"])
+    with pytest.raises(store.JobErased):
+        store.list_events(settings.db_path, doomed["job_id"])
+    assert lm.holder(settings.db_path, doomed["job_id"]) is None
+    assert store.claimable_jobs(settings.db_path) == []
+
+    # And the survivor's checkpoints are a complete, untouched sequence.
+    checkpoints = store.list_checkpoints(settings.db_path, survivor["job_id"])
+    assert [c["step"] for c in checkpoints] == list(
+        range(1, other["total_steps"] + 1)
+    )
+
+
+def test_erased_queued_job_is_never_claimed_by_a_worker(tmp_path):
+    settings = make_settings(tmp_path)
+    init_db(settings.db_path)
+    job = store.create_job(settings.db_path, *sample(16, seed=22), 2)
+    tombstone = store.erase_job(settings.db_path, job["job_id"])
+
+    worker, thread = run_worker(settings, "w1")
+    try:
+        time.sleep(1.0)
+    finally:
+        stop(worker, thread)
+
+    assert store.get_job(settings.db_path, job["job_id"]) == tombstone
+    assert store.claimable_jobs(settings.db_path) == []
+    with pytest.raises(store.JobErased):
+        store.list_checkpoints(settings.db_path, job["job_id"])

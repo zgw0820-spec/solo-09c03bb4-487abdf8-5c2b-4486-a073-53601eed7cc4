@@ -115,3 +115,96 @@ def test_workers_endpoint_empty(client):
     assert "lease_seconds" in data
     assert data["workers"] == []
     assert data["leases"] == []
+
+
+def test_erase_appears_in_swagger(client):
+    schema = client.get("/openapi.json").json()
+    assert "/jobs/{job_id}/erase" in schema["paths"]
+    assert "post" in schema["paths"]["/jobs/{job_id}/erase"]
+    assert "erasure" in {tag for path in schema["paths"].values() for op in path.values() for tag in op.get("tags", [])}
+
+
+def test_erase_completed_job_leaves_only_tombstone(client):
+    settings = Settings.from_env()
+    from app import lease as lm
+    from app import store
+
+    job = client.post("/jobs", json=payload(16, 2)).json()
+    lm.register_worker(settings.db_path, "w1")
+    lease = lm.acquire(settings.db_path, job["job_id"], "w1", settings.lease_seconds)
+    while True:
+        result = store.advance_job(settings.db_path, lease)
+        if result["status"] == "completed":
+            break
+
+    response = client.post(f"/jobs/{job['job_id']}/erase")
+    assert response.status_code == 200
+    tombstone = response.json()
+    assert tombstone == {
+        "job_id": job["job_id"],
+        "status": "erased",
+        "erased_at": tombstone["erased_at"],
+    }
+    assert isinstance(tombstone["erased_at"], float)
+
+    # Same id again: idempotent, same state, still 200.
+    retry = client.post(f"/jobs/{job['job_id']}/erase")
+    assert retry.status_code == 200
+    assert retry.json() == tombstone
+
+    # Reads return the tombstone (410) and no training data anywhere.
+    gone = client.get(f"/jobs/{job['job_id']}")
+    assert gone.status_code == 410
+    assert gone.json()["detail"]["status"] == "erased"
+    assert "weights" not in gone.json()["detail"]
+
+    assert client.get(f"/jobs/{job['job_id']}/checkpoints").status_code == 410
+    assert client.get(f"/jobs/{job['job_id']}/events").status_code == 410
+
+    listed = client.get("/jobs").json()
+    entry = next(j for j in listed if j["job_id"] == job["job_id"])
+    assert entry == tombstone
+    assert all("weights" not in j or j["job_id"] != job["job_id"] for j in listed)
+
+
+def test_erase_queued_job_and_unknown_id(client):
+    job = client.post("/jobs", json=payload(8, 2)).json()
+    response = client.post(f"/jobs/{job['job_id']}/erase")
+    assert response.status_code == 200
+    assert response.json()["status"] == "erased"
+    # A queued erased job must not be picked up: no worker claims it and the
+    # job listing keeps only the tombstone.
+    entry = next(j for j in client.get("/jobs").json() if j["job_id"] == job["job_id"])
+    assert set(entry) == {"job_id", "status", "erased_at"}
+
+    missing = client.post("/jobs/does-not-exist/erase")
+    assert missing.status_code == 404
+    assert client.get("/jobs/does-not-exist").status_code == 404
+    assert client.get("/jobs/does-not-exist/checkpoints").status_code == 404
+
+
+def test_erased_job_checkpoints_and_events_unreadable_but_others_work(client):
+    settings = Settings.from_env()
+    from app import lease as lm
+    from app import store
+
+    erased = client.post("/jobs", json=payload(12, 2)).json()
+    other = client.post("/jobs", json=payload(12, 2)).json()
+    lm.register_worker(settings.db_path, "w1")
+    for jid in (erased["job_id"], other["job_id"]):
+        lease = lm.acquire(settings.db_path, jid, "w1", settings.lease_seconds)
+        store.advance_job(settings.db_path, lease)
+        lm.release(settings.db_path, lease)
+
+    assert client.post(f"/jobs/{erased['job_id']}/erase").status_code == 200
+    assert client.get(f"/jobs/{erased['job_id']}/checkpoints").status_code == 410
+    assert client.get(f"/jobs/{erased['job_id']}/events").status_code == 410
+
+    # The other job's data is fully intact and still trainable.
+    remaining = client.get(f"/jobs/{other['job_id']}").json()
+    assert remaining["status"] == "running"
+    assert remaining["completed_steps"] == 1
+    checkpoints = client.get(f"/jobs/{other['job_id']}/checkpoints").json()
+    assert [c["step"] for c in checkpoints] == [1]
+    events = client.get(f"/jobs/{other['job_id']}/events").json()
+    assert events[0]["event"] == "job_created"

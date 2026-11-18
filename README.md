@@ -40,15 +40,37 @@ docker compose up -d --build
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | `POST` | `/jobs` | 提交 `{"features": [[...]], "labels": [...], "epochs": 3}`，返回 201 与任务 |
-| `GET` | `/jobs` | 最近任务列表 |
-| `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights` |
-| `GET` | `/jobs/{job_id}/checkpoints` | 全部批次断点（可按 `after_step` 增量拉取） |
-| `GET` | `/jobs/{job_id}/events` | 审计事件：创建、开始/从第几步续训、完成、丢失租约 |
+| `GET` | `/jobs` | 最近任务列表（含擦除墓碑，仅含任务号与擦除状态） |
+| `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights`；擦除后返回 410 与墓碑 |
+| `POST` | `/jobs/{job_id}/erase` | 擦除任务（排队/运行/已完成均可），幂等；成功仅保留任务号与擦除状态 |
+| `GET` | `/jobs/{job_id}/checkpoints` | 全部批次断点（可按 `after_step` 增量拉取）；擦除后返回 410 |
+| `GET` | `/jobs/{job_id}/events` | 审计事件：创建、开始/从第几步续训、完成、丢失租约；擦除后返回 410 |
 | `GET` | `/workers` | 工作器心跳与租约持有者 |
 | `GET` | `/health` | 健康检查 |
 
 `Swagger`（`/docs`）里直接 `POST /jobs` 提交即可看到训练开始；`GET /jobs/{id}` 与
-`GET /jobs/{id}/checkpoints` 查看进度与每个断点的权重/动量/损失。
+`GET /jobs/{id}/checkpoints` 查看进度与每个断点的权重/动量/损失。擦除在
+`erasure` 分组下，`POST /jobs/{id}/erase` 可直接调用。
+
+## 样本擦除（数据清退）
+
+运维按任务号清退训练数据时调用 `POST /jobs/{job_id}/erase`：
+
+- **适用范围**：排队（`queued`）、运行中（`running`）、已完成（`completed`）的
+  任务都可擦除；不存在的任务号返回 404。
+- **原子清理**：一次 `BEGIN IMMEDIATE` 事务内删除任务行（样本 `features_json`/
+  `labels_json`、当前权重与动量）、全部断点、全部审计事件和租约，只在
+  `erased_jobs` 表留下一行墓碑（`job_id`、`status='erased'`、`erased_at`）。
+  事务中任何一步失败都会整体回滚：不会报成功，也不会留下半删结果。
+- **幂等**：同一任务号重复擦除返回同一个墓碑（HTTP 200）。擦除后
+  `GET /jobs/{id}`、`/checkpoints`、`/events` 一律返回 410，样本、权重、断点、
+  事件均不可再读取；`GET /jobs` 列表里该任务只剩墓碑字段。
+- **与提交/接管交错**：擦除事务会删掉任务租约，正在训练的旧工作器下一次带围栏
+  的批次提交因租约校验失败（`LeaseLost`）或墓碑校验（`JobErased`）被拒绝，
+  不能再写断点、事件或把任务续训回来；`lease.acquire` 与任务认领路径也会跳过
+  墓碑，其他工作器无法重新领取。其他任务的训练不受影响、照常完成。
+- **重启持久**：墓碑就在共享 SQLite 文件中，API 与工作器重启、容器重建后擦除
+  状态仍然有效，重复擦除依旧返回同一状态。
 
 ## 续跑与防回退机制
 
@@ -72,7 +94,7 @@ python3 scripts/demo.py
 # 没有 Docker 时用本机进程演示同样流程
 python3 scripts/demo.py --local
 
-# 不依赖 Docker 的三项自检
+# 不依赖 Docker 的四项自检（含擦除：运行中擦除、410 不可读、幂等、围栏、其他任务照常）
 python3 scripts/selftest.py
 
 # 单元/集成测试（含真实 uvicorn + 两个工作器进程、SIGKILL 接管、迟到工作器围栏）
@@ -98,14 +120,14 @@ python3 -m pytest -q
 ## 目录
 
 ```
-app/main.py       API 与 Swagger
-app/worker.py     工作器主循环、租约续训
-app/store.py      任务状态机、批次提交、断点查询
-app/lease.py      租约获取/续约/围栏校验
+app/main.py       API 与 Swagger（含 POST /jobs/{id}/erase 擦除接口）
+app/worker.py     工作器主循环、租约续训、擦除围栏
+app/store.py      任务状态机、批次提交、断点查询、原子擦除与墓碑
+app/lease.py      租约获取/续约/围栏校验（拒绝已擦除任务）
 app/model.py      逻辑回归、交叉熵、SGD + 动量
 app/features.py   输入校验与标准化
-app/db.py         SQLite 连接与表结构
-tests/            单元、API、进程级集成测试
+app/db.py         SQLite 连接与表结构（含 erased_jobs 墓碑表）
+tests/            单元、API、进程级集成测试（含擦除交错与重启持久化）
 scripts/demo.py   Swagger 同款接口的端到端演示
 scripts/selftest.py  无 Docker 自检
 ```

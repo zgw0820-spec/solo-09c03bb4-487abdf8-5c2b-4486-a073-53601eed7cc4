@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -112,6 +113,16 @@ class Server:
         )
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read())
+
+    def request(self, method: str, path: str):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", method=method
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
 
 
 def start_worker(db: Path, worker_id: str, **env: str) -> subprocess.Popen:
@@ -283,3 +294,111 @@ def test_late_worker_cannot_regress_or_false_complete(tmp_path):
         finally:
             stop_worker(worker_a)
             stop_worker(worker_b)
+
+
+def test_erase_running_job_over_http_fences_real_workers(tmp_path):
+    """End-to-end erasure against the real API and a real worker process.
+
+    A worker trains a job; the job is erased mid-training; the worker must
+    never write another checkpoint or event, a second worker must never pick
+    the tombstone up, and a concurrent job must complete normally.
+    """
+    db = tmp_path / "training.db"
+    with Server(db, free_port()) as server:
+        doomed = server.post("/jobs", dataset(records=40, seed=31))
+        survivor = server.post("/jobs", dataset(records=16, seed=32))
+        worker_a = start_worker(db, "worker-a")
+        try:
+            wait_for(
+                lambda: server.get(f"/jobs/{doomed['job_id']}")["completed_steps"] >= 2,
+                timeout=60,
+                message="worker progress on doomed job",
+            )
+            status, tombstone = server.request(
+                "POST", f"/jobs/{doomed['job_id']}/erase"
+            )
+            assert status == 200
+            assert tombstone["status"] == "erased"
+            assert set(tombstone) == {"job_id", "status", "erased_at"}
+
+            # Idempotent retry over HTTP returns the same tombstone.
+            retry_status, retry = server.request(
+                "POST", f"/jobs/{doomed['job_id']}/erase"
+            )
+            assert retry_status == 200 and retry == tombstone
+
+            # All data reads are gone; the tombstone is all that remains.
+            gone_status, gone = server.request("GET", f"/jobs/{doomed['job_id']}")
+            assert gone_status == 410 and gone["detail"]["status"] == "erased"
+            cp_status, _ = server.request(
+                "GET", f"/jobs/{doomed['job_id']}/checkpoints"
+            )
+            ev_status, _ = server.request("GET", f"/jobs/{doomed['job_id']}/events")
+            assert cp_status == 410 and ev_status == 410
+
+            # A second worker joins; it must never claim the erased job, and
+            # the survivor still completes.
+            worker_b = start_worker(db, "worker-b")
+            try:
+                final = wait_completed(server, survivor["job_id"])
+                assert final["completed_steps"] == final["total_steps"]
+                # Give both workers a few poll cycles to (not) touch the tombstone.
+                time.sleep(1.0)
+                still_status, still = server.request(
+                    "GET", f"/jobs/{doomed['job_id']}"
+                )
+                assert still_status == 410 and still["detail"] == tombstone
+                assert server.request(
+                    "GET", f"/jobs/{doomed['job_id']}/checkpoints"
+                )[0] == 410
+                leases = server.get("/workers")["leases"]
+                assert all(lease["job_id"] != doomed["job_id"] for lease in leases)
+            finally:
+                stop_worker(worker_b)
+        finally:
+            stop_worker(worker_a)
+
+        listed = server.get("/jobs")
+        entry = next(j for j in listed if j["job_id"] == doomed["job_id"])
+        assert entry == tombstone
+        # Unknown id: 404, not a tombstone.
+        assert server.request("POST", "/jobs/unknown-id/erase")[0] == 404
+
+
+def test_erasure_survives_full_process_restart(tmp_path):
+    """The tombstone lives in SQLite: restarting API and workers keeps it."""
+    db = tmp_path / "training.db"
+    with Server(db, free_port()) as server:
+        job = server.post("/jobs", dataset(records=24, seed=33))
+        worker = start_worker(db, "worker-a")
+        try:
+            wait_for(
+                lambda: server.get(f"/jobs/{job['job_id']}")["completed_steps"] >= 2,
+                timeout=60,
+                message="first batches",
+            )
+        finally:
+            stop_worker(worker)
+        tombstone = server.request("POST", f"/jobs/{job['job_id']}/erase")[1]
+        assert tombstone["status"] == "erased"
+
+    # Everything is stopped.  Restart the API against the same database file
+    # and bring a worker back: erasure state must still hold.
+    with Server(db, free_port()) as restarted:
+        worker = start_worker(db, "worker-a")
+        try:
+            time.sleep(1.5)
+            status, body = restarted.request("GET", f"/jobs/{job['job_id']}")
+            assert status == 410 and body["detail"]["status"] == "erased"
+            assert body["detail"]["erased_at"] == tombstone["erased_at"]
+            assert restarted.request(
+                "GET", f"/jobs/{job['job_id']}/checkpoints"
+            )[0] == 410
+            # Retrying the erase after restart is still idempotent.
+            retry_status, retry = restarted.request(
+                "POST", f"/jobs/{job['job_id']}/erase"
+            )
+            assert retry_status == 200 and retry == tombstone
+            assert restarted.get("/workers")["leases"] == []
+        finally:
+            stop_worker(worker)

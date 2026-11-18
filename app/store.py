@@ -37,10 +37,15 @@ from .lease import Lease, LeaseLost, owner_ok
 from .model import dataset_loss, sgd_step
 
 JOB_STATUSES = ("queued", "running", "completed")
+ERASED_STATUS = "erased"
 
 
 class JobNotFound(LookupError):
     pass
+
+
+class JobErased(LookupError):
+    """The job was erased: its training data is gone and must stay gone."""
 
 
 class StateConflict(RuntimeError):
@@ -64,6 +69,63 @@ def _event(conn, job_id: str, event: str, detail: dict[str, Any] | None = None) 
         "INSERT INTO job_events(job_id, event, detail, created_at) VALUES(?, ?, ?, ?)",
         (job_id, event, json.dumps(detail or {}), time.time()),
     )
+
+
+def _tombstone(conn, job_id: str):
+    return conn.execute(
+        "SELECT job_id, status, erased_at FROM erased_jobs WHERE job_id=?", (job_id,)
+    ).fetchone()
+
+
+def _tombstone_dict(row) -> dict[str, Any]:
+    return {
+        "job_id": row["job_id"],
+        "status": row["status"],
+        "erased_at": float(row["erased_at"]),
+    }
+
+
+def get_tombstone(db_path, job_id: str) -> dict[str, Any] | None:
+    """Return the erasure record for ``job_id``, or ``None`` when not erased."""
+    with reader(db_path) as conn:
+        row = _tombstone(conn, job_id)
+        return _tombstone_dict(row) if row is not None else None
+
+
+def erase_job(db_path, job_id: str) -> dict[str, Any]:
+    """Erase every piece of training data for one job, atomically.
+
+    The job's samples (``features_json``/``labels_json``), current weights and
+    momentum, all checkpoints, all audit events and its lease are deleted in a
+    single ``BEGIN IMMEDIATE`` transaction and replaced by one tombstone row
+    holding only the job id and the erasure status.  Any error rolls the whole
+    transaction back, so a failed erase can neither report success nor leave a
+    half-deleted job.
+
+    The operation is idempotent: erasing an already-erased job returns the same
+    tombstone.  The monotonic ``lease_epochs`` counter is deliberately retained
+    - it carries no training data, and keeping it means a worker that still
+    holds a stale lease can never be mistaken for the owner of a freshly
+    recreated id.
+    """
+    now = time.time()
+    with transaction(db_path) as conn:
+        existing = _tombstone(conn, job_id)
+        if existing is not None:
+            return _tombstone_dict(existing)
+        if _job_row(conn, job_id) is None:
+            raise JobNotFound(job_id)
+        # Order matters with foreign_keys=ON: checkpoints reference the job row,
+        # so they must be removed before the job itself.
+        conn.execute("DELETE FROM checkpoints WHERE job_id=?", (job_id,))
+        conn.execute("DELETE FROM job_events WHERE job_id=?", (job_id,))
+        conn.execute("DELETE FROM leases WHERE job_id=?", (job_id,))
+        conn.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
+        conn.execute(
+            "INSERT INTO erased_jobs(job_id, status, erased_at) VALUES(?, ?, ?)",
+            (job_id, ERASED_STATUS, now),
+        )
+    return {"job_id": job_id, "status": ERASED_STATUS, "erased_at": now}
 
 
 def create_job(
@@ -133,8 +195,15 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
 
     The job row and its newest checkpoint are read in one transaction.  Their
     step and weights must agree; a mismatch would mean a torn commit.
+
+    An erased job has no training data left: only the tombstone (job id and
+    erasure status) is returned, so samples, weights and events can never be
+    read again through this path.
     """
     with reader(db_path) as conn:
+        tombstone = _tombstone(conn, job_id)
+        if tombstone is not None:
+            return _tombstone_dict(tombstone)
         row = _job_row(conn, job_id)
         if row is None:
             return None
@@ -187,7 +256,14 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
 def list_jobs(db_path, limit: int = 50) -> list[dict[str, Any]]:
     with reader(db_path) as conn:
         rows = conn.execute(
-            "SELECT job_id FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+            """
+            SELECT job_id, created_at AS sort_time FROM jobs
+            UNION ALL
+            SELECT job_id, erased_at AS sort_time FROM erased_jobs
+            ORDER BY sort_time DESC
+            LIMIT ?
+            """,
+            (limit,),
         ).fetchall()
     jobs = []
     for row in rows:
@@ -201,6 +277,8 @@ def list_checkpoints(
     db_path, job_id: str, after_step: int = 0, limit: int = 500
 ) -> list[dict[str, Any]]:
     with reader(db_path) as conn:
+        if _tombstone(conn, job_id) is not None:
+            raise JobErased(job_id)
         job = _job_row(conn, job_id)
         if job is None:
             raise JobNotFound(job_id)
@@ -232,6 +310,8 @@ def list_checkpoints(
 
 def list_events(db_path, job_id: str, limit: int = 200) -> list[dict[str, Any]]:
     with reader(db_path) as conn:
+        if _tombstone(conn, job_id) is not None:
+            raise JobErased(job_id)
         if _job_row(conn, job_id) is None:
             raise JobNotFound(job_id)
         rows = conn.execute(
@@ -279,6 +359,11 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
             raise LeaseLost(
                 f"job {lease.job_id} is no longer owned by {lease.worker_id}@{lease.epoch}"
             )
+        # Erasure deletes the lease (so owner_ok above already fences a stale
+        # holder); the tombstone check makes the refusal explicit and covers a
+        # race where a lease row was recreated after erasure.
+        if _tombstone(conn, lease.job_id) is not None:
+            raise JobErased(lease.job_id)
 
         row = _job_row(conn, lease.job_id)
         if row is None:
@@ -383,5 +468,13 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
 
 
 def record_event(db_path, job_id: str, event: str, detail: dict[str, Any] | None = None) -> None:
+    """Append an audit event, unless the job is gone or was erased.
+
+    A worker that discovers its job vanished mid-training calls this on the
+    way out; writing would either fail on the foreign key or resurrect an
+    erased job's event stream, so it is silently skipped.
+    """
     with transaction(db_path) as conn:
+        if _tombstone(conn, job_id) is not None or _job_row(conn, job_id) is None:
+            return
         _event(conn, job_id, event, detail)

@@ -79,14 +79,37 @@ def get_jobs(limit: int = Query(50, ge=1, le=200)) -> list[dict[str, Any]]:
 
 @app.get("/jobs/{job_id}", tags=["training"])
 def get_job(job_id: str) -> dict[str, Any]:
-    """Confirmed progress, loss, and the latest weights/momentum."""
+    """Confirmed progress, loss, and the latest weights/momentum.
+
+    An erased job returns 410 with its tombstone: only the job id and the
+    erasure status survive; samples, weights, checkpoints and events are gone.
+    """
     try:
         job = store.get_job(settings.db_path, job_id)
     except store.StateConflict as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    if job.get("status") == store.ERASED_STATUS:
+        raise HTTPException(status_code=410, detail=job)
     return job
+
+
+@app.post("/jobs/{job_id}/erase", tags=["erasure"], status_code=200)
+def erase_job(job_id: str) -> dict[str, Any]:
+    """Erase all training data of a job (queued, running or completed).
+
+    Samples, weights, momentum, checkpoints, audit events and the lease are
+    deleted in one atomic transaction; only the job id and the erasure status
+    remain as a tombstone.  Repeating the erase with the same job id is
+    idempotent and returns the same tombstone.  A worker still holding the job
+    is fenced: its lease is removed with the data, so it can no longer write
+    checkpoints, events or resume training.
+    """
+    try:
+        return store.erase_job(settings.db_path, job_id)
+    except store.JobNotFound as exc:
+        raise HTTPException(status_code=404, detail="job not found") from exc
 
 
 @app.get("/jobs/{job_id}/checkpoints", tags=["training"])
@@ -98,6 +121,11 @@ def get_checkpoints(
     """Batch checkpoints in step order, each with weights, momentum and loss."""
     try:
         return store.list_checkpoints(settings.db_path, job_id, after_step, limit)
+    except store.JobErased as exc:
+        raise HTTPException(
+            status_code=410,
+            detail={"job_id": str(exc), "status": store.ERASED_STATUS},
+        ) from exc
     except store.JobNotFound as exc:
         raise HTTPException(status_code=404, detail="job not found") from exc
 
@@ -107,6 +135,11 @@ def get_events(job_id: str) -> list[dict[str, Any]]:
     """Audit trail: creation, takeover/resume points and completion."""
     try:
         return store.list_events(settings.db_path, job_id)
+    except store.JobErased as exc:
+        raise HTTPException(
+            status_code=410,
+            detail={"job_id": str(exc), "status": store.ERASED_STATUS},
+        ) from exc
     except store.JobNotFound as exc:
         raise HTTPException(status_code=404, detail="job not found") from exc
 

@@ -6,6 +6,8 @@
 2. ``equivalence``: with real worker processes, kill one mid-training and prove
    the finished weights are bit-identical to an uninterrupted run.
 3. ``late``: a frozen (still-running) old worker cannot write after takeover.
+4. ``erasure``: erase a running job over HTTP; its data becomes unreadable,
+   workers are fenced, a retry is idempotent and another job still completes.
 
 Each check prints PASS/FAIL and exits non-zero if anything fails.
 """
@@ -19,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -271,6 +274,68 @@ def check_late_worker(tmp: Path) -> bool:
     return True
 
 
+def request(method: str, port: int, path: str):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def check_erasure(tmp: Path) -> bool:
+    db = tmp / "erase.db"
+    api, port = start_api(db)
+    doomed = post(port, "/jobs", dataset(seed=11, records=40))
+    survivor = post(port, "/jobs", dataset(seed=12, records=16))
+    worker_a = start_worker(db, "worker-a")
+    try:
+        wait_for(
+            lambda: get(port, f"/jobs/{doomed['job_id']}")["completed_steps"] >= 2,
+            60,
+            "progress on doomed job",
+        )
+        status, tombstone = request("POST", port, f"/jobs/{doomed['job_id']}/erase")
+        assert status == 200 and tombstone["status"] == "erased", (status, tombstone)
+        assert set(tombstone) == {"job_id", "status", "erased_at"}
+
+        # Idempotent retry returns the same tombstone.
+        retry_status, retry = request("POST", port, f"/jobs/{doomed['job_id']}/erase")
+        assert retry_status == 200 and retry == tombstone
+
+        # All training-data reads are gone; the job id and erasure state remain.
+        gone_status, gone = request("GET", port, f"/jobs/{doomed['job_id']}")
+        assert gone_status == 410 and gone["detail"]["status"] == "erased"
+        assert request("GET", port, f"/jobs/{doomed['job_id']}/checkpoints")[0] == 410
+        assert request("GET", port, f"/jobs/{doomed['job_id']}/events")[0] == 410
+        assert request("POST", port, "/jobs/unknown-id/erase")[0] == 404
+
+        # A second worker must never pick the tombstone up; the survivor finishes.
+        worker_b = start_worker(db, "worker-b")
+        try:
+            final = completed_state(port, survivor["job_id"])
+            time.sleep(1.0)
+            assert request("GET", port, f"/jobs/{doomed['job_id']}")[0] == 410
+            assert request(
+                "GET", port, f"/jobs/{doomed['job_id']}/checkpoints"
+            )[0] == 410
+            leases = get(port, "/workers")["leases"]
+            assert all(lease["job_id"] != doomed["job_id"] for lease in leases)
+        finally:
+            stop(worker_b)
+    finally:
+        stop(worker_a)
+        stop(api)
+
+    assert final["status"] == "completed"
+    assert final["completed_steps"] == final["total_steps"]
+    print(
+        "  PASS: running job erased atomically, data unreadable, retry idempotent,"
+        " workers fenced, other job completed"
+    )
+    return True
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as raw:
@@ -279,6 +344,7 @@ def main() -> int:
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
+            ("erasure", lambda: check_erasure(tmp)),
         ):
             print(f"[{name}]")
             try:

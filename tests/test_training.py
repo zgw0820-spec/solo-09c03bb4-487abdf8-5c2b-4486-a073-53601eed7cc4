@@ -272,3 +272,205 @@ def test_reacquired_lease_never_reuses_an_epoch(settings):
     assert store.get_job(settings.db_path, job["job_id"])["completed_steps"] == 0
     store.advance_job(settings.db_path, second)
     assert store.get_job(settings.db_path, job["job_id"])["completed_steps"] == 1
+
+
+# --------------------------------------------------------------------------
+# Erasure
+# --------------------------------------------------------------------------
+def test_erase_deletes_everything_but_the_tombstone(settings):
+    features, labels = sample(20, seed=12)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "w")
+    lease = lm.acquire(settings.db_path, job["job_id"], "w", settings.lease_seconds)
+    for _ in range(3):
+        store.advance_job(settings.db_path, lease)
+
+    tombstone = store.erase_job(settings.db_path, job["job_id"])
+    assert set(tombstone) == {"job_id", "status", "erased_at"}
+    assert tombstone["status"] == "erased"
+
+    # Repeated erase returns the same state (idempotent).
+    assert store.erase_job(settings.db_path, job["job_id"]) == tombstone
+
+    # Only the tombstone survives; no samples, weights, checkpoints, events
+    # or lease rows remain anywhere.
+    from app.db import reader
+
+    with reader(settings.db_path) as conn:
+        for table in ("jobs", "checkpoints", "job_events", "leases"):
+            assert conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE job_id=?", (job["job_id"],)
+            ).fetchone()[0] == 0
+        row = conn.execute(
+            "SELECT job_id, status FROM erased_jobs WHERE job_id=?", (job["job_id"],)
+        ).fetchone()
+        assert row["status"] == "erased"
+
+    assert store.get_job(settings.db_path, job["job_id"]) == tombstone
+    with pytest.raises(store.JobErased):
+        store.list_checkpoints(settings.db_path, job["job_id"])
+    with pytest.raises(store.JobErased):
+        store.list_events(settings.db_path, job["job_id"])
+    assert store.claimable_jobs(settings.db_path) == []
+    assert lm.holder(settings.db_path, job["job_id"]) is None
+
+
+def test_erase_unknown_job_raises_not_found(settings):
+    with pytest.raises(store.JobNotFound):
+        store.erase_job(settings.db_path, "never-existed")
+
+
+def test_erase_tombstone_survives_db_reopen(settings):
+    from app.db import init_db
+
+    features, labels = sample(16, seed=13)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    tombstone = store.erase_job(settings.db_path, job["job_id"])
+
+    # Simulate an API/worker restart: schema init runs again and every
+    # connection is re-opened.  The erasure state must persist.
+    init_db(settings.db_path)
+    assert store.get_job(settings.db_path, job["job_id"]) == tombstone
+    assert store.erase_job(settings.db_path, job["job_id"]) == tombstone
+    with pytest.raises(store.JobErased):
+        store.list_checkpoints(settings.db_path, job["job_id"])
+
+
+def test_failed_erase_rolls_back_without_half_deleted_state(settings):
+    import sqlite3
+
+    from app.db import connect
+
+    features, labels = sample(16, seed=14)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "w")
+    lease = lm.acquire(settings.db_path, job["job_id"], "w", settings.lease_seconds)
+    store.advance_job(settings.db_path, lease)
+
+    # A trigger makes the tombstone INSERT fail: the whole erase transaction
+    # must roll back, so nothing is half deleted and no success is reported.
+    conn = connect(settings.db_path)
+    conn.execute(
+        "CREATE TRIGGER fail_erase BEFORE INSERT ON erased_jobs "
+        "BEGIN SELECT RAISE(ABORT, 'simulated erasure failure'); END"
+    )
+    conn.close()
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            store.erase_job(settings.db_path, job["job_id"])
+    finally:
+        conn = connect(settings.db_path)
+        conn.execute("DROP TRIGGER fail_erase")
+        conn.close()
+
+    from app.db import reader
+
+    with reader(settings.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM erased_jobs").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE job_id=?", (job["job_id"],)
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE job_id=?", (job["job_id"],)
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM leases WHERE job_id=?", (job["job_id"],)
+        ).fetchone()[0] == 1
+
+    # The job remains fully readable and trainable after the failed erase.
+    state = store.get_job(settings.db_path, job["job_id"])
+    assert state["status"] == "running" and state["completed_steps"] == 1
+    assert store.advance_job(settings.db_path, lease)["step"] == 2
+
+    # Once the failure is gone, erase succeeds cleanly.
+    tombstone = store.erase_job(settings.db_path, job["job_id"])
+    assert tombstone["status"] == "erased"
+    assert store.get_job(settings.db_path, job["job_id"]) == tombstone
+
+
+def test_stale_worker_cannot_write_after_erasure(settings):
+    """Interleave: erase while a worker is mid-training.
+
+    The old holder's lease is deleted inside the erasure transaction, so its
+    next fenced commit is refused; no checkpoint, event or completion can be
+    resurrected, and no other worker can re-acquire the erased job.
+    """
+    features, labels = sample(24, seed=15)
+    job = store.create_job(settings.db_path, features, labels, 3)
+    lm.register_worker(settings.db_path, "old")
+    lm.register_worker(settings.db_path, "new")
+    old = lm.acquire(settings.db_path, job["job_id"], "old", settings.lease_seconds)
+    store.advance_job(settings.db_path, old)
+    assert store.get_job(settings.db_path, job["job_id"])["completed_steps"] == 1
+
+    store.erase_job(settings.db_path, job["job_id"])
+
+    # The stale holder cannot commit another batch (lease gone + tombstone).
+    with pytest.raises((LeaseLost, store.JobErased, store.JobNotFound)):
+        store.advance_job(settings.db_path, old)
+    # It cannot append events either.
+    store.record_event(settings.db_path, job["job_id"], "lease_lost", {"worker_id": "old"})
+    with pytest.raises(store.JobErased):
+        store.list_events(settings.db_path, job["job_id"])
+    # A fresh worker cannot claim or re-lease the erased job.
+    assert lm.acquire(settings.db_path, job["job_id"], "new", settings.lease_seconds) is None
+    assert store.claimable_jobs(settings.db_path) == []
+    assert store.get_job(settings.db_path, job["job_id"])["status"] == "erased"
+
+
+def test_other_jobs_keep_training_after_an_erasure(settings):
+    features, labels = sample(16, seed=16)
+    erased = store.create_job(settings.db_path, features, labels, 2)
+    survivor = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "w")
+    lease = lm.acquire(settings.db_path, survivor["job_id"], "w", settings.lease_seconds)
+    store.advance_job(settings.db_path, lease)
+
+    store.erase_job(settings.db_path, erased["job_id"])
+
+    while True:
+        result = store.advance_job(settings.db_path, lease)
+        if result["status"] == "completed":
+            break
+    final = store.get_job(settings.db_path, survivor["job_id"])
+    assert final["status"] == "completed"
+    assert final["completed_steps"] == final["total_steps"] == 4
+    checkpoints = store.list_checkpoints(settings.db_path, survivor["job_id"])
+    assert [c["step"] for c in checkpoints] == [1, 2, 3, 4]
+
+
+def test_erase_interleaved_with_batch_commit(settings):
+    """A batch commit and an erase serialise; neither can see a torn state."""
+    import threading
+
+    features, labels = sample(32, seed=17)
+    job = store.create_job(settings.db_path, features, labels, 3)
+    lm.register_worker(settings.db_path, "w")
+    lease = lm.acquire(settings.db_path, job["job_id"], "w", settings.lease_seconds)
+    store.advance_job(settings.db_path, lease)
+
+    errors: list[Exception] = []
+
+    def commit_batches() -> None:
+        try:
+            while True:
+                result = store.advance_job(settings.db_path, lease)
+                if result["status"] == "completed":
+                    return
+        except (LeaseLost, store.JobErased, store.JobNotFound) as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=commit_batches)
+    worker.start()
+    # Erase while the worker thread is still committing batches.
+    tombstone = store.erase_job(settings.db_path, job["job_id"])
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    final = store.get_job(settings.db_path, job["job_id"])
+    assert final == tombstone
+    with pytest.raises(store.JobErased):
+        store.list_checkpoints(settings.db_path, job["job_id"])
+    with pytest.raises(store.JobErased):
+        store.list_events(settings.db_path, job["job_id"])
+    assert lm.holder(settings.db_path, job["job_id"]) is None

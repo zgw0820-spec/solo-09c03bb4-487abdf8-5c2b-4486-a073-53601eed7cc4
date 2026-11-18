@@ -80,6 +80,17 @@ def acquire(
     """
     now = time.time()
     with transaction(path) as conn:
+        # An erased job must never be claimed or re-leased; its tombstone is
+        # the only surviving state.  A missing job is refused the same way so
+        # no lease row can ever outlive its job.
+        if conn.execute(
+            "SELECT 1 FROM erased_jobs WHERE job_id=?", (job_id,)
+        ).fetchone() is not None:
+            return None
+        if conn.execute(
+            "SELECT 1 FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone() is None:
+            return None
         row = conn.execute("SELECT * FROM leases WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
             epoch = _allocate_epoch(conn, job_id)
